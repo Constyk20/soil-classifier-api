@@ -1,0 +1,42 @@
+{
+  "timestamp": "2025-11-03T04:20:45.046997",
+  "dataset_size": 994,
+  "features": [
+    "sand_percent",
+    "silt_percent",
+    "clay_percent",
+    "ph",
+    "organic_content",
+    "nitrogen",
+    "phosphorus",
+    "potassium"
+  ],
+  "soil_types": [
+    "Alluvial_Soil",
+    "Arid_Soil",
+    "Black_Soil",
+    "Laterite_Soil",
+    "Mountain_Soil",
+    "Red_Soil",
+    "Yellow_Soil"
+  ],
+  "model_results": {
+    "SVM": {
+      "accuracy": 0.8492462311557789,
+      "best_params": {
+        "C": 100,
+        "gamma": "scale",
+        "kernel": "rbf"
+      }
+    },
+    "RandomForest": {
+      "accuracy": 0.9396984924623115,
+      "best_params": {
+        "max_depth": 20,
+        "min_samples_leaf": 1,
+        "min_samples_split": 2,
+        "n_estimators": 100
+      }
+    }
+  }
+}
