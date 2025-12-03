@@ -1,3 +1,6 @@
+# Python version (forces Render to use 3.11.9)
+python==3.11.9
+
 fastapi==0.115.0
 uvicorn[standard]==0.30.6
 tensorflow==2.15.0
@@ -7,5 +10,6 @@ python-multipart==0.0.9
 scikit-learn==1.5.1
 joblib==1.4.2
 python-dotenv==1.0.1
+requests==2.32.3
 pydantic==2.9.2
 numpy==1.26.4
