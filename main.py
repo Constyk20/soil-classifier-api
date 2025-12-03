@@ -143,24 +143,22 @@ def download_cnn_model():
     
     logger.info("📥 Downloading soil_model_7class.h5 from Google Drive (~112 MB)...")
     try:
-        response = requests.get(CNN_MODEL_URL, stream=True)
-        response.raise_for_status()
+        # Use gdown library for reliable Google Drive downloads
+        import gdown
         
-        total_size = int(response.headers.get('content-length', 0))
-        downloaded = 0
-        chunk_size = 1024 * 1024  # 1MB
+        file_id = "1jMe-JKQHf8-YlhtiVI4ds_O2yjfOKzbE"
+        url = f"https://drive.google.com/uc?id={file_id}"
         
-        with open(CNN_MODEL_PATH, "wb") as f:
-            for chunk in response.iter_content(chunk_size=chunk_size):
-                if chunk:
-                    f.write(chunk)
-                    downloaded += len(chunk)
-                    if total_size > 0:
-                        percent = (downloaded / total_size) * 100
-                        print(f"\rDownloading... {percent:.1f}%", end="")
+        gdown.download(url, str(CNN_MODEL_PATH), quiet=False)
         
-        print("\n✅ CNN model downloaded successfully!")
+        # Verify the file was downloaded correctly
+        if not CNN_MODEL_PATH.exists() or CNN_MODEL_PATH.stat().st_size < 1000000:  # Less than 1MB
+            raise Exception("Download failed or file is too small")
+        
         logger.info("✅ CNN model downloaded successfully!")
+    except ImportError:
+        logger.error("❌ gdown not installed. Install with: pip install gdown")
+        raise
     except Exception as e:
         logger.error(f"❌ Failed to download CNN model: {e}")
         raise
