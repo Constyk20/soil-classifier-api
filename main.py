@@ -279,11 +279,17 @@ async def lifespan(app: FastAPI):
     # Load Preprocessor
     logger.info(f"🔧 Loading preprocessor from: {PREPROCESSOR_PATH}")
     try:
+        # Ensure the SoilDataPreprocessor class is available in this module
+        import sys
+        sys.modules['__main__'].SoilDataPreprocessor = SoilDataPreprocessor
+        
         with open(PREPROCESSOR_PATH, 'rb') as f:
             preprocessor = pickle.load(f)
         logger.info("✅ Preprocessor loaded")
     except Exception as e:
         logger.warning(f"⚠️ Preprocessor not found: {e}")
+        logger.info("Creating new preprocessor instance...")
+        preprocessor = SoilDataPreprocessor()
     
     logger.info("🎉 API is ready!")
     
