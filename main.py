@@ -1,4 +1,8 @@
 # main.py - Unified Soil Classification API (CNN + SVM + Random Forest)
+import os
+# Force TensorFlow to use legacy Keras (compatible with older .h5 models)
+os.environ['TF_USE_LEGACY_KERAS'] = '1'
+
 from fastapi import FastAPI, File, UploadFile, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from contextlib import asynccontextmanager
@@ -222,18 +226,37 @@ async def lifespan(app: FastAPI):
     logger.info(f"🤖 Loading CNN model from: {CNN_MODEL_PATH}")
     try:
         if CNN_MODEL_PATH.exists():
-            # Load with legacy format support for older Keras models
+            # Load model with backward compatibility for older Keras formats
+            import tensorflow as tf
+            # Disable Keras 3 if available (TF 2.15 can use Keras 2 or 3)
+            import os
+            os.environ['TF_USE_LEGACY_KERAS'] = '1'
+            
             cnn_model = tf.keras.models.load_model(
                 str(CNN_MODEL_PATH),
-                compile=False,  # Skip compilation to avoid optimizer issues
-                safe_mode=False  # Allow legacy format
+                compile=False  # Skip compilation to avoid optimizer issues
             )
-            logger.info("✅ CNN model loaded")
+            logger.info("✅ CNN model loaded successfully")
         else:
             logger.warning("⚠️ CNN model file not found - image classification will be disabled")
     except Exception as e:
         logger.error(f"❌ CNN model loading failed: {e}")
-        logger.warning("⚠️ Continuing without CNN model")
+        logger.warning("⚠️ Continuing without CNN model - will retry using legacy Keras")
+        try:
+            # Fallback: Try with h5py directly
+            import h5py
+            with h5py.File(str(CNN_MODEL_PATH), 'r') as f:
+                logger.info("Model file is readable, trying alternative load method...")
+            # Try loading with custom objects
+            cnn_model = tf.keras.models.load_model(
+                str(CNN_MODEL_PATH),
+                compile=False,
+                options=tf.saved_model.LoadOptions(experimental_io_device='/job:localhost')
+            )
+            logger.info("✅ CNN model loaded with fallback method")
+        except Exception as e2:
+            logger.error(f"❌ Fallback loading also failed: {e2}")
+            logger.warning("⚠️ API will continue without CNN model")
     
     # Load SVM Model
     logger.info(f"🤖 Loading SVM model from: {SVM_MODEL_PATH}")
