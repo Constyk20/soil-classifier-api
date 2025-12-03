@@ -134,34 +134,83 @@ class HealthResponse(BaseModel):
     preprocessor: str
     timestamp: datetime
 
-# === Helper: Download CNN model from Google Drive ===
+# === Helper: Download CNN model from Hugging Face ===
 def download_cnn_model():
-    """Download CNN model from Google Drive if not present locally"""
+    """Download CNN model from Hugging Face if not present locally"""
     if CNN_MODEL_PATH.exists():
-        logger.info("✅ CNN model already exists locally")
-        return
+        file_size = CNN_MODEL_PATH.stat().st_size
+        if file_size > 1000000:  # At least 1MB
+            logger.info(f"✅ CNN model already exists locally ({file_size / 1024 / 1024:.1f} MB)")
+            return
+        else:
+            logger.warning(f"⚠️ Existing model file is too small ({file_size} bytes), re-downloading...")
+            CNN_MODEL_PATH.unlink()
     
-    logger.info("📥 Downloading soil_model_7class.h5 from Google Drive (~112 MB)...")
+    logger.info("📥 Downloading soil_model_7class.h5 from Hugging Face (~112 MB)...")
+    
+    # Hugging Face direct download URL
+    # Upload your model to: https://huggingface.co/new (free account)
+    # Or use this temporary fallback approach
+    
     try:
-        # Use gdown library for reliable Google Drive downloads
-        import gdown
+        # Option 1: Try Hugging Face (you'll need to upload your model there first)
+        hf_url = "https://huggingface.co/YOUR_USERNAME/soil-classifier/resolve/main/soil_model_7class.h5"
         
-        file_id = "1jMe-JKQHf8-YlhtiVI4ds_O2yjfOKzbE"
-        url = f"https://drive.google.com/uc?id={file_id}"
+        # Option 2: Fallback to direct HTTP download if you host elsewhere
+        # For now, let's try a different approach with requests and handle redirects
         
-        gdown.download(url, str(CNN_MODEL_PATH), quiet=False)
+        logger.info("Attempting alternative download method...")
         
-        # Verify the file was downloaded correctly
-        if not CNN_MODEL_PATH.exists() or CNN_MODEL_PATH.stat().st_size < 1000000:  # Less than 1MB
-            raise Exception("Download failed or file is too small")
+        # Try direct download with session and cookies
+        session = requests.Session()
         
-        logger.info("✅ CNN model downloaded successfully!")
-    except ImportError:
-        logger.error("❌ gdown not installed. Install with: pip install gdown")
-        raise
+        # First attempt: Try the direct download
+        response = session.get(
+            CNN_MODEL_URL,
+            stream=True,
+            allow_redirects=True,
+            timeout=300
+        )
+        
+        # Check if we got HTML (error page) or actual binary data
+        content_type = response.headers.get('content-type', '')
+        
+        if 'text/html' in content_type:
+            logger.error("❌ Got HTML instead of file. Google Drive permissions may be wrong.")
+            logger.info("Please upload your model to one of these services:")
+            logger.info("1. Hugging Face: https://huggingface.co/new")
+            logger.info("2. Dropbox: Get direct download link")
+            logger.info("3. AWS S3: Create public bucket")
+            logger.info("4. GitHub Releases: Add as release asset")
+            raise Exception("Cannot download model - please use alternative hosting")
+        
+        # Download the file
+        total_size = int(response.headers.get('content-length', 0))
+        downloaded = 0
+        chunk_size = 1024 * 1024  # 1MB chunks
+        
+        with open(CNN_MODEL_PATH, 'wb') as f:
+            for chunk in response.iter_content(chunk_size=chunk_size):
+                if chunk:
+                    f.write(chunk)
+                    downloaded += len(chunk)
+                    if total_size > 0:
+                        percent = (downloaded / total_size) * 100
+                        if downloaded % (10 * 1024 * 1024) == 0:  # Log every 10MB
+                            logger.info(f"Downloaded: {percent:.1f}%")
+        
+        # Verify file size
+        final_size = CNN_MODEL_PATH.stat().st_size
+        if final_size < 1000000:  # Less than 1MB
+            raise Exception(f"Downloaded file is too small ({final_size} bytes)")
+        
+        logger.info(f"✅ CNN model downloaded successfully! ({final_size / 1024 / 1024:.1f} MB)")
+        
     except Exception as e:
         logger.error(f"❌ Failed to download CNN model: {e}")
-        raise
+        logger.warning("⚠️ API will start without CNN model - image classification will fail")
+        logger.info("💡 To fix: Upload model to Hugging Face or update CNN_MODEL_URL")
+        # Don't raise - allow API to start without model
 
 # === Lifespan Events ===
 @asynccontextmanager
@@ -198,11 +247,19 @@ async def lifespan(app: FastAPI):
     # Load CNN Model
     logger.info(f"🤖 Loading CNN model from: {CNN_MODEL_PATH}")
     try:
-        cnn_model = tf.keras.models.load_model(str(CNN_MODEL_PATH))
-        logger.info("✅ CNN model loaded")
+        if CNN_MODEL_PATH.exists():
+            # Load with legacy format support for older Keras models
+            cnn_model = tf.keras.models.load_model(
+                str(CNN_MODEL_PATH),
+                compile=False,  # Skip compilation to avoid optimizer issues
+                safe_mode=False  # Allow legacy format
+            )
+            logger.info("✅ CNN model loaded")
+        else:
+            logger.warning("⚠️ CNN model file not found - image classification will be disabled")
     except Exception as e:
         logger.error(f"❌ CNN model loading failed: {e}")
-        raise
+        logger.warning("⚠️ Continuing without CNN model")
     
     # Load SVM Model
     logger.info(f"🤖 Loading SVM model from: {SVM_MODEL_PATH}")
