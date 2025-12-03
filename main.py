@@ -19,6 +19,14 @@ from pathlib import Path
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+# === Preprocessor Class (needed for loading pickle) ===
+class SoilDataPreprocessor:
+    """Preprocessor for soil chemistry data"""
+    def __init__(self):
+        from sklearn.preprocessing import StandardScaler, LabelEncoder
+        self.scaler = StandardScaler()
+        self.label_encoder = LabelEncoder()
+
 # === Configuration ===
 ATLAS_URI = "mongodb+srv://achidubem1215_db_user:batkid123@soil-cluster.oewl8ku.mongodb.net/soil_db?retryWrites=true&w=majority"
 
@@ -31,8 +39,8 @@ SVM_MODEL_PATH = MODEL_DIR / "svm_model.pkl"
 RF_MODEL_PATH = MODEL_DIR / "randomforest_model.pkl"
 PREPROCESSOR_PATH = MODEL_DIR / "preprocessor.pkl"
 
-# Google Drive direct download URL
-CNN_MODEL_URL = "https://drive.google.com/uc?export=download&id=1jMe-JKQHf8-YlhtiVI4ds_O2yjfOKzbE"
+# Dropbox direct download URL (change dl=0 to dl=1 for direct download)
+CNN_MODEL_URL = "https://www.dropbox.com/scl/fi/pc0dgb8u9i5okoxgpm051/soil_model_7class.h5?rlkey=ggzdkjlypiixbiiyxbud3ex0q&st=msyr0vaw&dl=1"
 
 # === Soil Classes and Crop Suggestions ===
 CLASS_NAMES = [
@@ -134,9 +142,9 @@ class HealthResponse(BaseModel):
     preprocessor: str
     timestamp: datetime
 
-# === Helper: Download CNN model from Hugging Face ===
+# === Helper: Download CNN model from Dropbox ===
 def download_cnn_model():
-    """Download CNN model from Hugging Face if not present locally"""
+    """Download CNN model from Dropbox if not present locally"""
     if CNN_MODEL_PATH.exists():
         file_size = CNN_MODEL_PATH.stat().st_size
         if file_size > 1000000:  # At least 1MB
@@ -146,45 +154,13 @@ def download_cnn_model():
             logger.warning(f"⚠️ Existing model file is too small ({file_size} bytes), re-downloading...")
             CNN_MODEL_PATH.unlink()
     
-    logger.info("📥 Downloading soil_model_7class.h5 from Hugging Face (~112 MB)...")
-    
-    # Hugging Face direct download URL
-    # Upload your model to: https://huggingface.co/new (free account)
-    # Or use this temporary fallback approach
+    logger.info("📥 Downloading soil_model_7class.h5 from Dropbox (~112 MB)...")
     
     try:
-        # Option 1: Try Hugging Face (you'll need to upload your model there first)
-        hf_url = "https://huggingface.co/YOUR_USERNAME/soil-classifier/resolve/main/soil_model_7class.h5"
+        # Direct download from Dropbox (dl=1 parameter ensures direct download)
+        response = requests.get(CNN_MODEL_URL, stream=True, timeout=300)
+        response.raise_for_status()
         
-        # Option 2: Fallback to direct HTTP download if you host elsewhere
-        # For now, let's try a different approach with requests and handle redirects
-        
-        logger.info("Attempting alternative download method...")
-        
-        # Try direct download with session and cookies
-        session = requests.Session()
-        
-        # First attempt: Try the direct download
-        response = session.get(
-            CNN_MODEL_URL,
-            stream=True,
-            allow_redirects=True,
-            timeout=300
-        )
-        
-        # Check if we got HTML (error page) or actual binary data
-        content_type = response.headers.get('content-type', '')
-        
-        if 'text/html' in content_type:
-            logger.error("❌ Got HTML instead of file. Google Drive permissions may be wrong.")
-            logger.info("Please upload your model to one of these services:")
-            logger.info("1. Hugging Face: https://huggingface.co/new")
-            logger.info("2. Dropbox: Get direct download link")
-            logger.info("3. AWS S3: Create public bucket")
-            logger.info("4. GitHub Releases: Add as release asset")
-            raise Exception("Cannot download model - please use alternative hosting")
-        
-        # Download the file
         total_size = int(response.headers.get('content-length', 0))
         downloaded = 0
         chunk_size = 1024 * 1024  # 1MB chunks
@@ -194,10 +170,9 @@ def download_cnn_model():
                 if chunk:
                     f.write(chunk)
                     downloaded += len(chunk)
-                    if total_size > 0:
+                    if total_size > 0 and downloaded % (20 * 1024 * 1024) == 0:  # Log every 20MB
                         percent = (downloaded / total_size) * 100
-                        if downloaded % (10 * 1024 * 1024) == 0:  # Log every 10MB
-                            logger.info(f"Downloaded: {percent:.1f}%")
+                        logger.info(f"Downloaded: {downloaded / 1024 / 1024:.1f} MB ({percent:.1f}%)")
         
         # Verify file size
         final_size = CNN_MODEL_PATH.stat().st_size
@@ -209,7 +184,6 @@ def download_cnn_model():
     except Exception as e:
         logger.error(f"❌ Failed to download CNN model: {e}")
         logger.warning("⚠️ API will start without CNN model - image classification will fail")
-        logger.info("💡 To fix: Upload model to Hugging Face or update CNN_MODEL_URL")
         # Don't raise - allow API to start without model
 
 # === Lifespan Events ===
