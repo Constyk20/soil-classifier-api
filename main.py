@@ -107,6 +107,7 @@ class ChemistryClassificationResult(BaseModel):
     
     class Config:
         populate_by_name = True
+        protected_namespaces = ()  # Fix Pydantic warning
 
 class HistoryItem(BaseModel):
     soilType: str
@@ -177,8 +178,11 @@ async def lifespan(app: FastAPI):
     try:
         client = AsyncIOMotorClient(
             ATLAS_URI,
-            serverSelectionTimeoutMS=5000,
-            connectTimeoutMS=10000
+            serverSelectionTimeoutMS=10000,
+            connectTimeoutMS=20000,
+            tlsAllowInvalidCertificates=True,  # Fix for Render SSL issues
+            retryWrites=True,
+            w='majority'
         )
         db = client["soil_db"]
         collection = db["classifications"]
@@ -187,7 +191,8 @@ async def lifespan(app: FastAPI):
         await collection.create_index([("createdAt", -1)])
     except Exception as e:
         logger.error(f"❌ MongoDB connection failed: {e}")
-        raise
+        logger.warning("⚠️ Continuing without database (classification will fail)")
+        # Don't raise - allow app to start even if DB fails
     
     # Download CNN model if missing
     download_cnn_model()
