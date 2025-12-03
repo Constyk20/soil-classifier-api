@@ -1,6 +1,3 @@
-# Python version (forces Render to use 3.11.9)
-python==3.11.9
-
 fastapi==0.115.0
 uvicorn[standard]==0.30.6
 tensorflow==2.15.0
