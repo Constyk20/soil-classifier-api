@@ -22,7 +22,6 @@ import pickle
 import requests
 from pathlib import Path
 import h5py
-import json
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -195,160 +194,131 @@ def download_cnn_model():
         logger.warning("⚠️ API will start without CNN model - image classification will fail")
         # Don't raise - allow API to start without model
 
-# === Helper: Fix DTypePolicy issue for Keras 3 models ===
-def create_compatible_custom_objects():
-    """Create custom objects to handle Keras 3 compatibility issues"""
+# === Helper: Fix InputLayer deserialization for Keras 2/3 compatibility ===
+def create_compatible_model_loader():
+    """Create a function to load model with Keras 2/3 compatibility"""
+    
+    def fix_layer_config(config):
+        """Fix layer configuration for compatibility"""
+        # Keras 3 uses 'batch_shape' while Keras 2 uses 'batch_input_shape'
+        if 'batch_shape' in config:
+            config['batch_input_shape'] = config.pop('batch_shape')
+        # Remove any other incompatible keys
+        if 'ragged' in config:
+            config.pop('ragged')
+        return config
+    
+    # Define custom objects for compatibility
     custom_objects = {}
     
     try:
-        # Try to import Keras 3 components
-        import keras
-        from keras import DTypePolicy
+        # Try to import Keras 2
+        from keras.layers import InputLayer
+        from keras.engine.input_layer import InputLayer as InputLayerV2
         
-        # Create a wrapper for DTypePolicy
-        class CompatibleDTypePolicy(DTypePolicy):
+        class CompatibleInputLayer(InputLayer):
             @classmethod
-            def from_config(cls, config):
-                # Extract just the name if needed
-                if isinstance(config, dict):
-                    return DTypePolicy(name=config.get('name', 'float32'))
-                return DTypePolicy(name='float32')
+            def from_config(cls, config, custom_objects=None):
+                fixed_config = fix_layer_config(config)
+                return cls(**fixed_config)
         
-        custom_objects['DTypePolicy'] = CompatibleDTypePolicy
-        
-        # Add other Keras 3 layers that might cause issues
-        from keras import layers
-        
-        # Create compatibility wrappers for common layers
-        for layer_name in ['Conv2D', 'Dense', 'Dropout', 'Flatten', 'GlobalAveragePooling2D', 
-                          'MaxPooling2D', 'InputLayer', 'BatchNormalization']:
-            if hasattr(layers, layer_name):
-                layer_class = getattr(layers, layer_name)
-                custom_objects[layer_name] = layer_class
-        
-        logger.info("✅ Created Keras 3 compatible custom objects")
+        custom_objects['InputLayer'] = CompatibleInputLayer
+        logger.info("✅ Using Keras 2 compatible loader")
         
     except ImportError:
         try:
-            # Fallback to tf.keras
-            from tensorflow.keras import layers
+            # Try to import from tf.keras
+            from tensorflow.keras.layers import InputLayer
             
-            for layer_name in ['Conv2D', 'Dense', 'Dropout', 'Flatten', 'GlobalAveragePooling2D', 
-                              'MaxPooling2D', 'InputLayer', 'BatchNormalization']:
-                if hasattr(layers, layer_name):
-                    layer_class = getattr(layers, layer_name)
-                    custom_objects[layer_name] = layer_class
+            class CompatibleInputLayer(InputLayer):
+                @classmethod
+                def from_config(cls, config, custom_objects=None):
+                    fixed_config = fix_layer_config(config)
+                    return cls(**fixed_config)
             
-            logger.info("✅ Created tf.keras compatible custom objects")
+            custom_objects['InputLayer'] = CompatibleInputLayer
+            logger.info("✅ Using tf.keras compatible loader")
             
-        except Exception as e:
-            logger.warning(f"⚠️ Could not create custom objects: {e}")
+        except ImportError:
+            logger.warning("⚠️ Using fallback loader without custom InputLayer")
     
     return custom_objects
 
-def load_cnn_model_with_keras3_fix(model_path):
-    """Load CNN model with Keras 3 compatibility fixes"""
+def load_model_with_fallback(model_path):
+    """Try multiple methods to load the model"""
+    
+    # Method 1: Try loading with custom objects
     try:
-        # Method 1: Try with custom objects for Keras 3
-        custom_objects = create_compatible_custom_objects()
-        
-        # Add a custom DTypePolicy handler
-        class SimpleDTypePolicy:
-            def __init__(self, name='float32'):
-                self.name = name
-            
-            @classmethod
-            def from_config(cls, config):
-                if isinstance(config, dict):
-                    return cls(name=config.get('name', 'float32'))
-                return cls()
-        
-        custom_objects['DTypePolicy'] = SimpleDTypePolicy
-        
-        # Try loading with compile=False and custom objects
+        custom_objects = create_compatible_model_loader()
         model = tf.keras.models.load_model(
             str(model_path),
             compile=False,
             custom_objects=custom_objects
         )
-        logger.info("✅ CNN model loaded with Keras 3 compatibility fix")
+        logger.info("✅ Model loaded with custom objects")
         return model
-        
     except Exception as e1:
         logger.warning(f"Method 1 failed: {e1}")
+    
+    # Method 2: Try loading weights only with architecture extraction
+    try:
+        # Extract architecture from H5 file
+        with h5py.File(str(model_path), 'r') as f:
+            # Check model configuration
+            model_config = f.attrs.get('model_config', {})
+            logger.info(f"Model config type: {type(model_config)}")
         
-        # Method 2: Try loading weights only by creating a matching architecture
+        # Create a generic CNN architecture (common for image classification)
+        from tensorflow.keras import layers, models
+        
+        inputs = tf.keras.Input(shape=(224, 224, 3))
+        
+        # Base convolutional layers
+        x = layers.Conv2D(32, (3, 3), activation='relu')(inputs)
+        x = layers.MaxPooling2D((2, 2))(x)
+        x = layers.Conv2D(64, (3, 3), activation='relu')(x)
+        x = layers.MaxPooling2D((2, 2))(x)
+        x = layers.Conv2D(128, (3, 3), activation='relu')(x)
+        x = layers.MaxPooling2D((2, 2))(x)
+        x = layers.Conv2D(256, (3, 3), activation='relu')(x)
+        x = layers.MaxPooling2D((2, 2))(x)
+        
+        # Dense layers
+        x = layers.Flatten()(x)
+        x = layers.Dense(512, activation='relu')(x)
+        x = layers.Dropout(0.5)(x)
+        x = layers.Dense(256, activation='relu')(x)
+        x = layers.Dropout(0.3)(x)
+        outputs = layers.Dense(len(CLASS_NAMES), activation='softmax')(x)
+        
+        model = models.Model(inputs=inputs, outputs=outputs)
+        
+        # Try to load weights
         try:
-            logger.info("🔄 Attempting to extract model architecture from H5 file...")
-            
-            with h5py.File(str(model_path), 'r') as f:
-                # Try to read model config
-                if 'model_config' in f.attrs:
-                    model_config_str = f.attrs['model_config']
-                    try:
-                        model_config = json.loads(model_config_str)
-                        logger.info(f"📋 Model architecture: {model_config.get('class_name', 'Unknown')}")
-                        
-                        # Check if it's a MobileNetV2-based model
-                        layers_config = model_config.get('config', {}).get('layers', [])
-                        for layer in layers_config:
-                            if 'class_name' in layer and 'MobileNetV2' in layer['class_name']:
-                                logger.info("🔍 Detected MobileNetV2 architecture")
-                                # Create MobileNetV2 based model
-                                base_model = tf.keras.applications.MobileNetV2(
-                                    input_shape=(224, 224, 3),
-                                    include_top=False,
-                                    weights=None
-                                )
-                                base_model.trainable = False
-                                
-                                model = tf.keras.Sequential([
-                                    base_model,
-                                    tf.keras.layers.GlobalAveragePooling2D(),
-                                    tf.keras.layers.Dense(128, activation='relu'),
-                                    tf.keras.layers.Dropout(0.5),
-                                    tf.keras.layers.Dense(len(CLASS_NAMES), activation='softmax')
-                                ])
-                                
-                                # Try to load weights
-                                model.load_weights(str(model_path))
-                                logger.info("✅ Created MobileNetV2 architecture with loaded weights")
-                                return model
-                    except:
-                        pass
-            
-            # Fallback: Create a generic CNN architecture
-            logger.info("🔄 Creating generic CNN architecture...")
-            
-            model = tf.keras.Sequential([
-                tf.keras.layers.Input(shape=(224, 224, 3)),
-                tf.keras.layers.Conv2D(32, (3, 3), activation='relu'),
-                tf.keras.layers.MaxPooling2D((2, 2)),
-                tf.keras.layers.Conv2D(64, (3, 3), activation='relu'),
-                tf.keras.layers.MaxPooling2D((2, 2)),
-                tf.keras.layers.Conv2D(128, (3, 3), activation='relu'),
-                tf.keras.layers.MaxPooling2D((2, 2)),
-                tf.keras.layers.Flatten(),
-                tf.keras.layers.Dense(512, activation='relu'),
-                tf.keras.layers.Dropout(0.5),
-                tf.keras.layers.Dense(256, activation='relu'),
-                tf.keras.layers.Dropout(0.3),
-                tf.keras.layers.Dense(len(CLASS_NAMES), activation='softmax')
-            ])
-            
-            # Try to load weights (might fail but that's okay)
-            try:
-                model.load_weights(str(model_path))
-                logger.info("✅ Loaded weights onto generic architecture")
-            except:
-                logger.warning("⚠️ Could not load weights, using initialized model")
-                # Compile the model
-                model.compile(optimizer='adam', loss='categorical_crossentropy', metrics=['accuracy'])
-            
-            return model
-            
-        except Exception as e2:
-            logger.error(f"Method 2 failed: {e2}")
+            model.load_weights(str(model_path))
+            logger.info("✅ Model weights loaded onto generic architecture")
+        except:
+            logger.info("⚠️ Could not load weights, using initialized model")
+        
+        return model
+        
+    except Exception as e2:
+        logger.error(f"Method 2 failed: {e2}")
+    
+    # Method 3: Try using keras directly (for Keras 3)
+    try:
+        import keras
+        # Force Keras to use TensorFlow backend
+        keras.config.set_backend("tensorflow")
+        
+        model = keras.models.load_model(
+            str(model_path),
+            compile=False
+        )
+        logger.info("✅ Model loaded with Keras 3")
+        return model
+    except Exception as e3:
+        logger.error(f"Method 3 failed: {e3}")
     
     return None
 
@@ -383,24 +353,16 @@ async def lifespan(app: FastAPI):
     # Download CNN model if missing
     download_cnn_model()
     
-    # Load CNN Model with Keras 3 compatibility fixes
+    # Load CNN Model with compatibility fixes
     logger.info(f"🤖 Loading CNN model from: {CNN_MODEL_PATH}")
     if CNN_MODEL_PATH.exists():
         file_size = CNN_MODEL_PATH.stat().st_size
         if file_size > 1000000:
-            cnn_model = load_cnn_model_with_keras3_fix(CNN_MODEL_PATH)
+            cnn_model = load_model_with_fallback(CNN_MODEL_PATH)
             if cnn_model:
                 logger.info("✅ CNN model loaded successfully")
-                
-                # Test the model with a dummy input
-                try:
-                    test_input = np.random.randn(1, 224, 224, 3).astype(np.float32)
-                    test_prediction = cnn_model.predict(test_input, verbose=0)
-                    logger.info(f"✅ Model test prediction shape: {test_prediction.shape}")
-                except Exception as e:
-                    logger.warning(f"⚠️ Model test failed: {e}")
             else:
-                logger.error("❌ CNN model loading failed")
+                logger.error("❌ All CNN model loading methods failed")
                 cnn_model = None
         else:
             logger.warning(f"⚠️ CNN model file too small ({file_size} bytes)")
@@ -455,7 +417,7 @@ async def lifespan(app: FastAPI):
 # === Initialize App ===
 app = FastAPI(
     title="Unified Soil Classifier API",
-    version="3.3",
+    version="3.2",
     description="AI-powered soil classification using CNN (images) or ML models (chemistry data)",
     lifespan=lifespan
 )
@@ -475,7 +437,7 @@ async def root():
     """Root endpoint"""
     return {
         "message": "🌱 Unified Soil Classification API",
-        "version": "3.3",
+        "version": "3.2",
         "methods": {
             "image": "CNN classification from soil images",
             "chemistry": "SVM/RF classification from soil chemistry data"
@@ -485,7 +447,6 @@ async def root():
             "classify_chemistry": "/classify-chemistry (POST)",
             "history": "/history (GET)",
             "health": "/health (GET)",
-            "models/status": "/models/status (GET)",
             "docs": "/docs (API Documentation)"
         }
     }
@@ -554,26 +515,12 @@ async def classify_image(file: UploadFile = File(...)):
     
     try:
         predictions = cnn_model.predict(arr, verbose=0)
-        
-        # Get top 3 predictions
-        top_indices = np.argsort(predictions[0])[-3:][::-1]
-        
-        idx = int(top_indices[0])
+        idx = int(np.argmax(predictions[0]))
         confidence = float(predictions[0][idx])
         soil_type = CLASS_NAMES[idx] if idx < len(CLASS_NAMES) else "Unknown"
         crops = CROP_SUGGESTIONS.get(soil_type, "No suggestions")
         
-        # Log top 3 predictions for debugging
-        top_predictions = []
-        for i, pred_idx in enumerate(top_indices):
-            if pred_idx < len(CLASS_NAMES):
-                pred_class = CLASS_NAMES[pred_idx]
-                pred_conf = float(predictions[0][pred_idx])
-                top_predictions.append(f"{pred_class}: {pred_conf:.2%}")
-        
         logger.info(f"✅ CNN Prediction: {soil_type} ({confidence:.2%})")
-        logger.info(f"📊 Top 3: {', '.join(top_predictions)}")
-        
     except Exception as e:
         logger.error(f"Model prediction failed: {e}")
         raise HTTPException(status_code=500, detail=f"Prediction failed: {str(e)}")
@@ -587,8 +534,7 @@ async def classify_image(file: UploadFile = File(...)):
                 "crops": crops,
                 "method": "CNN",
                 "createdAt": datetime.utcnow(),
-                "filename": file.filename,
-                "top_predictions": top_predictions if 'top_predictions' in locals() else []
+                "filename": file.filename
             })
             record_id = str(result.inserted_id)
         else:
@@ -788,19 +734,8 @@ async def get_model_status():
         "loaded": cnn_model is not None,
         "path": str(CNN_MODEL_PATH),
         "exists": CNN_MODEL_PATH.exists(),
-        "size": CNN_MODEL_PATH.stat().st_size if CNN_MODEL_PATH.exists() else 0,
-        "type": str(type(cnn_model)) if cnn_model else None
+        "size": CNN_MODEL_PATH.stat().st_size if CNN_MODEL_PATH.exists() else 0
     }
-    
-    # Test model if loaded
-    if cnn_model:
-        try:
-            test_input = np.random.randn(1, 224, 224, 3).astype(np.float32)
-            test_output = cnn_model.predict(test_input, verbose=0)
-            cnn_details["test_output_shape"] = test_output.shape
-            cnn_details["test_output_sample"] = test_output[0].tolist()[:3]
-        except Exception as e:
-            cnn_details["test_error"] = str(e)
     
     return {
         "cnn_model": cnn_details,
@@ -809,41 +744,6 @@ async def get_model_status():
         "preprocessor": {"loaded": preprocessor is not None},
         "database": {"connected": client is not None}
     }
-
-@app.post("/test-prediction", tags=["Debug"])
-async def test_prediction():
-    """Test endpoint to verify model predictions"""
-    if not cnn_model:
-        raise HTTPException(status_code=503, detail="CNN model not loaded")
-    
-    try:
-        # Create test image (gray image)
-        test_image = np.ones((224, 224, 3), dtype=np.float32) * 0.5
-        test_input = np.expand_dims(test_image, axis=0)
-        
-        # Get predictions
-        predictions = cnn_model.predict(test_input, verbose=0)[0]
-        
-        # Get all predictions sorted
-        sorted_indices = np.argsort(predictions)[::-1]
-        
-        result = {
-            "predictions": []
-        }
-        
-        for idx in sorted_indices:
-            if idx < len(CLASS_NAMES):
-                result["predictions"].append({
-                    "class": CLASS_NAMES[idx],
-                    "confidence": float(predictions[idx]),
-                    "percentage": f"{predictions[idx]*100:.2f}%"
-                })
-        
-        return result
-        
-    except Exception as e:
-        logger.error(f"Test prediction failed: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
 
 if __name__ == "__main__":
     import uvicorn
