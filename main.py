@@ -1,12 +1,7 @@
 # main.py - Unified Soil Classification API (CNN + SVM + Random Forest)
 import os
-import sys
 # Force TensorFlow to use legacy Keras (compatible with older .h5 models)
 os.environ['TF_USE_LEGACY_KERAS'] = '1'
-os.environ['TF_ENABLE_ONEDNN_OPTS'] = '0'  # Disable OneDNN optimizations
-
-# Add current directory to path for custom module imports
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from fastapi import FastAPI, File, UploadFile, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
@@ -15,7 +10,6 @@ from PIL import Image
 import io
 import numpy as np
 import tensorflow as tf
-import keras
 from motor.motor_asyncio import AsyncIOMotorClient
 from pydantic import BaseModel, Field
 from datetime import datetime
@@ -24,8 +18,6 @@ import logging
 import pickle
 import requests
 from pathlib import Path
-import h5py
-import json
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -38,10 +30,6 @@ class SoilDataPreprocessor:
         from sklearn.preprocessing import StandardScaler, LabelEncoder
         self.scaler = StandardScaler()
         self.label_encoder = LabelEncoder()
-    
-    def transform(self, X):
-        """Transform input data"""
-        return self.scaler.transform(X)
 
 # === Configuration ===
 ATLAS_URI = "mongodb+srv://achidubem1215_db_user:batkid123@soil-cluster.oewl8ku.mongodb.net/soil_db?retryWrites=true&w=majority"
@@ -163,7 +151,7 @@ def download_cnn_model():
     """Download CNN model from Dropbox if not present locally"""
     if CNN_MODEL_PATH.exists():
         file_size = CNN_MODEL_PATH.stat().st_size
-        if file_size > 100000000:  # At least 100MB
+        if file_size > 1000000:  # At least 1MB
             logger.info(f"✅ CNN model already exists locally ({file_size / 1024 / 1024:.1f} MB)")
             return
         else:
@@ -192,7 +180,7 @@ def download_cnn_model():
         
         # Verify file size
         final_size = CNN_MODEL_PATH.stat().st_size
-        if final_size < 100000000:  # Less than 100MB
+        if final_size < 1000000:  # Less than 1MB
             raise Exception(f"Downloaded file is too small ({final_size} bytes)")
         
         logger.info(f"✅ CNN model downloaded successfully! ({final_size / 1024 / 1024:.1f} MB)")
@@ -201,138 +189,6 @@ def download_cnn_model():
         logger.error(f"❌ Failed to download CNN model: {e}")
         logger.warning("⚠️ API will start without CNN model - image classification will fail")
         # Don't raise - allow API to start without model
-
-# === Fix for loading Keras 3 models ===
-def fix_keras_model_config(model_path):
-    """Fix Keras 3 model config to be compatible with TensorFlow 2.15"""
-    try:
-        with h5py.File(model_path, 'r+') as f:
-            if 'model_config' in f.attrs:
-                config_str = f.attrs['model_config']
-                config = json.loads(config_str)
-                
-                # Fix InputLayer config
-                def fix_layers(layers):
-                    for layer in layers:
-                        if 'config' in layer:
-                            config = layer['config']
-                            # Remove batch_shape if present
-                            if 'batch_shape' in config:
-                                del config['batch_shape']
-                            # Fix other incompatible parameters
-                            if 'dtype' in config and config['dtype'] == 'float32':
-                                # Keep dtype as string
-                                config['dtype'] = 'float32'
-                        # Recursively fix nested layers
-                        if 'layers' in layer:
-                            fix_layers(layer['layers'])
-                
-                if 'config' in config and 'layers' in config['config']:
-                    fix_layers(config['config']['layers'])
-                
-                # Write back fixed config
-                f.attrs['model_config'] = json.dumps(config)
-                logger.info("✅ Fixed Keras model config for compatibility")
-                
-    except Exception as e:
-        logger.warning(f"⚠️ Could not fix model config: {e}")
-
-def load_cnn_model_with_fixes(model_path):
-    """Load CNN model with multiple fallback strategies"""
-    if not model_path.exists():
-        return None
-    
-    strategies = [
-        # Strategy 1: Try with custom_objects for Keras 2
-        lambda: tf.keras.models.load_model(
-            str(model_path),
-            compile=False,
-            custom_objects={
-                'InputLayer': tf.keras.layers.InputLayer
-            }
-        ),
-        
-        # Strategy 2: Try loading weights only
-        lambda: load_model_weights_only(model_path),
-        
-        # Strategy 3: Try with legacy Keras
-        lambda: keras.models.load_model(
-            str(model_path),
-            compile=False
-        ),
-        
-        # Strategy 4: Build model from scratch and load weights
-        lambda: build_and_load_model(model_path)
-    ]
-    
-    for i, strategy in enumerate(strategies, 1):
-        try:
-            logger.info(f"Trying strategy {i} to load CNN model...")
-            model = strategy()
-            logger.info(f"✅ Successfully loaded model with strategy {i}")
-            return model
-        except Exception as e:
-            logger.warning(f"Strategy {i} failed: {e}")
-    
-    return None
-
-def load_model_weights_only(model_path):
-    """Load model architecture from JSON and weights from H5"""
-    with h5py.File(model_path, 'r') as f:
-        # Try to extract model config
-        if 'model_config' in f.attrs:
-            config = json.loads(f.attrs['model_config'])
-            
-            # Create a simple model if we can parse the config
-            model = tf.keras.Sequential([
-                tf.keras.layers.Input(shape=(224, 224, 3)),
-                tf.keras.layers.Conv2D(32, (3, 3), activation='relu'),
-                tf.keras.layers.MaxPooling2D((2, 2)),
-                tf.keras.layers.Conv2D(64, (3, 3), activation='relu'),
-                tf.keras.layers.MaxPooling2D((2, 2)),
-                tf.keras.layers.Conv2D(64, (3, 3), activation='relu'),
-                tf.keras.layers.Flatten(),
-                tf.keras.layers.Dense(64, activation='relu'),
-                tf.keras.layers.Dense(7, activation='softmax')
-            ])
-            
-            # Load weights
-            model.load_weights(str(model_path))
-            return model
-    
-    raise Exception("Could not load model weights")
-
-def build_and_load_model(model_path):
-    """Build a standard CNN model and load weights"""
-    model = tf.keras.Sequential([
-        tf.keras.layers.InputLayer(input_shape=(224, 224, 3)),
-        tf.keras.layers.Conv2D(32, (3, 3), activation='relu'),
-        tf.keras.layers.MaxPooling2D((2, 2)),
-        tf.keras.layers.Conv2D(64, (3, 3), activation='relu'),
-        tf.keras.layers.MaxPooling2D((2, 2)),
-        tf.keras.layers.Conv2D(128, (3, 3), activation='relu'),
-        tf.keras.layers.MaxPooling2D((2, 2)),
-        tf.keras.layers.Flatten(),
-        tf.keras.layers.Dense(128, activation='relu'),
-        tf.keras.layers.Dropout(0.5),
-        tf.keras.layers.Dense(7, activation='softmax')
-    ])
-    
-    # Compile model
-    model.compile(
-        optimizer='adam',
-        loss='categorical_crossentropy',
-        metrics=['accuracy']
-    )
-    
-    # Try to load weights
-    try:
-        model.load_weights(str(model_path))
-    except:
-        # If weights loading fails, just return the untrained model
-        pass
-    
-    return model
 
 # === Lifespan Events ===
 @asynccontextmanager
@@ -368,23 +224,39 @@ async def lifespan(app: FastAPI):
     
     # Load CNN Model
     logger.info(f"🤖 Loading CNN model from: {CNN_MODEL_PATH}")
-    
-    # First, try to fix the model config if needed
-    if CNN_MODEL_PATH.exists():
-        try:
-            fix_keras_model_config(CNN_MODEL_PATH)
-        except Exception as e:
-            logger.warning(f"Could not fix model config: {e}")
-        
-        # Try multiple strategies to load the model
-        cnn_model = load_cnn_model_with_fixes(CNN_MODEL_PATH)
-        
-        if cnn_model:
+    try:
+        if CNN_MODEL_PATH.exists():
+            # Load model with backward compatibility for older Keras formats
+            import tensorflow as tf
+            # Disable Keras 3 if available (TF 2.15 can use Keras 2 or 3)
+            import os
+            os.environ['TF_USE_LEGACY_KERAS'] = '1'
+            
+            cnn_model = tf.keras.models.load_model(
+                str(CNN_MODEL_PATH),
+                compile=False  # Skip compilation to avoid optimizer issues
+            )
             logger.info("✅ CNN model loaded successfully")
         else:
-            logger.warning("⚠️ Could not load CNN model - image classification will be disabled")
-    else:
-        logger.warning("⚠️ CNN model file not found - image classification will be disabled")
+            logger.warning("⚠️ CNN model file not found - image classification will be disabled")
+    except Exception as e:
+        logger.error(f"❌ CNN model loading failed: {e}")
+        logger.warning("⚠️ Continuing without CNN model - will retry using legacy Keras")
+        try:
+            # Fallback: Try with h5py directly
+            import h5py
+            with h5py.File(str(CNN_MODEL_PATH), 'r') as f:
+                logger.info("Model file is readable, trying alternative load method...")
+            # Try loading with custom objects
+            cnn_model = tf.keras.models.load_model(
+                str(CNN_MODEL_PATH),
+                compile=False,
+                options=tf.saved_model.LoadOptions(experimental_io_device='/job:localhost')
+            )
+            logger.info("✅ CNN model loaded with fallback method")
+        except Exception as e2:
+            logger.error(f"❌ Fallback loading also failed: {e2}")
+            logger.warning("⚠️ API will continue without CNN model")
     
     # Load SVM Model
     logger.info(f"🤖 Loading SVM model from: {SVM_MODEL_PATH}")
@@ -407,9 +279,9 @@ async def lifespan(app: FastAPI):
     # Load Preprocessor
     logger.info(f"🔧 Loading preprocessor from: {PREPROCESSOR_PATH}")
     try:
-        # Register the preprocessor class before loading
-        import __main__
-        __main__.SoilDataPreprocessor = SoilDataPreprocessor
+        # Ensure the SoilDataPreprocessor class is available in this module
+        import sys
+        sys.modules['__main__'].SoilDataPreprocessor = SoilDataPreprocessor
         
         with open(PREPROCESSOR_PATH, 'rb') as f:
             preprocessor = pickle.load(f)
@@ -430,7 +302,7 @@ async def lifespan(app: FastAPI):
 # === Initialize App ===
 app = FastAPI(
     title="Unified Soil Classifier API",
-    version="3.2",
+    version="3.1",
     description="AI-powered soil classification using CNN (images) or ML models (chemistry data)",
     lifespan=lifespan
 )
@@ -450,7 +322,7 @@ async def root():
     """Root endpoint"""
     return {
         "message": "🌱 Unified Soil Classification API",
-        "version": "3.2",
+        "version": "3.1",
         "methods": {
             "image": "CNN classification from soil images",
             "chemistry": "SVM/RF classification from soil chemistry data"
@@ -491,18 +363,38 @@ async def classify_image(file: UploadFile = File(...)):
     if not cnn_model:
         raise HTTPException(status_code=503, detail="CNN model not available")
     
-    if not file.content_type or not file.content_type.startswith("image/"):
-        raise HTTPException(status_code=400, detail="Invalid file type")
+    # More lenient content type checking
+    if file.content_type:
+        if not (file.content_type.startswith("image/") or file.content_type == "application/octet-stream"):
+            logger.warning(f"Unexpected content type: {file.content_type}, but will try to process anyway")
     
-    contents = await file.read()
+    # Check file extension as backup
+    if file.filename:
+        extension = file.filename.lower().split('.')[-1]
+        allowed_extensions = ['jpg', 'jpeg', 'png', 'gif', 'webp', 'bmp', 'heic', 'heif']
+        if extension not in allowed_extensions:
+            raise HTTPException(
+                status_code=400, 
+                detail=f"Invalid file extension: .{extension}. Allowed: {', '.join(allowed_extensions)}"
+            )
+    
+    try:
+        contents = await file.read()
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Failed to read file: {str(e)}")
+    
     if len(contents) > 10 * 1024 * 1024:
         raise HTTPException(status_code=400, detail="File too large (max 10MB)")
     
+    if len(contents) < 100:
+        raise HTTPException(status_code=400, detail="File too small or empty")
+    
     try:
         image = Image.open(io.BytesIO(contents)).convert("RGB")
-        logger.info(f"📸 Processing image: {file.filename}")
-    except:
-        raise HTTPException(status_code=400, detail="Invalid image file")
+        logger.info(f"📸 Processing image: {file.filename} ({len(contents)} bytes, {image.size})")
+    except Exception as e:
+        logger.error(f"Failed to open image: {e}")
+        raise HTTPException(status_code=400, detail=f"Invalid image file: {str(e)}")
     
     # Preprocess and predict
     image = image.resize((224, 224))
@@ -518,30 +410,29 @@ async def classify_image(file: UploadFile = File(...)):
         
         logger.info(f"✅ CNN Prediction: {soil_type} ({confidence:.2%})")
     except Exception as e:
-        logger.error(f"❌ Prediction failed: {e}")
-        # Fallback prediction
-        idx = np.random.randint(0, len(CLASS_NAMES))
-        confidence = 0.8
-        soil_type = CLASS_NAMES[idx]
-        crops = CROP_SUGGESTIONS.get(soil_type, "No suggestions")
-        logger.warning(f"⚠️ Using fallback prediction: {soil_type}")
+        logger.error(f"Model prediction failed: {e}")
+        raise HTTPException(status_code=500, detail=f"Prediction failed: {str(e)}")
     
     # Save to database
-    result = await collection.insert_one({
-        "soilType": soil_type,
-        "confidence": confidence,
-        "crops": crops,
-        "method": "CNN",
-        "createdAt": datetime.utcnow(),
-        "filename": file.filename
-    })
+    try:
+        result = await collection.insert_one({
+            "soilType": soil_type,
+            "confidence": confidence,
+            "crops": crops,
+            "method": "CNN",
+            "createdAt": datetime.utcnow(),
+            "filename": file.filename
+        })
+    except Exception as e:
+        logger.warning(f"Failed to save to database: {e}")
+        # Continue anyway - prediction succeeded
     
     return ClassificationResult(
         soilType=soil_type,
         confidence=round(confidence, 4),
         crops=crops,
         method="CNN",
-        _id=str(result.inserted_id),
+        _id=str(result.inserted_id) if 'result' in locals() else "local",
         createdAt=datetime.utcnow()
     )
 
@@ -578,11 +469,7 @@ async def classify_chemistry(data: SoilChemistryInput):
     ]])
     
     # Normalize using saved preprocessor
-    try:
-        input_normalized = preprocessor.transform(input_array)
-    except:
-        # If transform fails, use the scaler directly
-        input_normalized = preprocessor.scaler.transform(input_array)
+    input_normalized = preprocessor.scaler.transform(input_array)
     
     # Predict with both models
     svm_pred = svm_model.predict(input_normalized)[0]
