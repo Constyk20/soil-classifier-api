@@ -472,15 +472,41 @@ async def classify_chemistry(data: SoilChemistryInput):
     input_normalized = preprocessor.scaler.transform(input_array)
     
     # Predict with both models
-    svm_pred = svm_model.predict(input_normalized)[0]
-    svm_proba = svm_model.predict_proba(input_normalized)[0]
-    svm_confidence = float(svm_proba[svm_pred])
-    svm_soil_type = preprocessor.label_encoder.inverse_transform([svm_pred])[0]
+    try:
+        svm_pred = svm_model.predict(input_normalized)[0]
+        
+        # Try to get probability, but use decision function if probability is not available
+        try:
+            svm_proba = svm_model.predict_proba(input_normalized)[0]
+            svm_confidence = float(svm_proba[svm_pred])
+        except AttributeError:
+            # SVM was trained without probability=True, use decision function
+            logger.warning("SVM model doesn't have predict_proba, using decision function")
+            decision_values = svm_model.decision_function(input_normalized)[0]
+            # Convert decision function to pseudo-probability (0-1 range)
+            if hasattr(decision_values, '__len__'):
+                # Multi-class: get max decision value
+                max_decision = max(decision_values)
+                # Normalize to 0-1 using sigmoid-like function
+                svm_confidence = 1 / (1 + np.exp(-max_decision))
+            else:
+                # Binary or single value
+                svm_confidence = 1 / (1 + np.exp(-abs(decision_values)))
+            svm_confidence = float(svm_confidence)
+        
+        svm_soil_type = preprocessor.label_encoder.inverse_transform([svm_pred])[0]
+    except Exception as e:
+        logger.error(f"SVM prediction failed: {e}")
+        raise HTTPException(status_code=500, detail=f"SVM prediction failed: {str(e)}")
     
-    rf_pred = rf_model.predict(input_normalized)[0]
-    rf_proba = rf_model.predict_proba(input_normalized)[0]
-    rf_confidence = float(rf_proba[rf_pred])
-    rf_soil_type = preprocessor.label_encoder.inverse_transform([rf_pred])[0]
+    try:
+        rf_pred = rf_model.predict(input_normalized)[0]
+        rf_proba = rf_model.predict_proba(input_normalized)[0]
+        rf_confidence = float(rf_proba[rf_pred])
+        rf_soil_type = preprocessor.label_encoder.inverse_transform([rf_pred])[0]
+    except Exception as e:
+        logger.error(f"Random Forest prediction failed: {e}")
+        raise HTTPException(status_code=500, detail=f"Random Forest prediction failed: {str(e)}")
     
     # Use the model with higher confidence
     if svm_confidence >= rf_confidence:
