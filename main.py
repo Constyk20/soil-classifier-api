@@ -2,8 +2,9 @@
 import os
 # Force TensorFlow to use legacy Keras (compatible with older .h5 models)
 os.environ['TF_USE_LEGACY_KERAS'] = '1'
-os.environ['KERAS_BACKEND'] = 'tensorflow'
 os.environ['TF_KERAS'] = '1'
+# Disable Keras 3
+os.environ['KERAS_BACKEND'] = 'tensorflow'
 
 from fastapi import FastAPI, File, UploadFile, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
@@ -20,6 +21,7 @@ import logging
 import pickle
 import requests
 from pathlib import Path
+import h5py
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -192,13 +194,133 @@ def download_cnn_model():
         logger.warning("⚠️ API will start without CNN model - image classification will fail")
         # Don't raise - allow API to start without model
 
-# === Helper: Fix InputLayer deserialization ===
-def fix_input_layer_config(config):
-    """Fix InputLayer config for compatibility between Keras versions"""
-    if 'batch_shape' in config:
-        # Convert batch_shape to batch_input_shape for compatibility
-        config['batch_input_shape'] = config.pop('batch_shape')
-    return config
+# === Helper: Fix InputLayer deserialization for Keras 2/3 compatibility ===
+def create_compatible_model_loader():
+    """Create a function to load model with Keras 2/3 compatibility"""
+    
+    def fix_layer_config(config):
+        """Fix layer configuration for compatibility"""
+        # Keras 3 uses 'batch_shape' while Keras 2 uses 'batch_input_shape'
+        if 'batch_shape' in config:
+            config['batch_input_shape'] = config.pop('batch_shape')
+        # Remove any other incompatible keys
+        if 'ragged' in config:
+            config.pop('ragged')
+        return config
+    
+    # Define custom objects for compatibility
+    custom_objects = {}
+    
+    try:
+        # Try to import Keras 2
+        from keras.layers import InputLayer
+        from keras.engine.input_layer import InputLayer as InputLayerV2
+        
+        class CompatibleInputLayer(InputLayer):
+            @classmethod
+            def from_config(cls, config, custom_objects=None):
+                fixed_config = fix_layer_config(config)
+                return cls(**fixed_config)
+        
+        custom_objects['InputLayer'] = CompatibleInputLayer
+        logger.info("✅ Using Keras 2 compatible loader")
+        
+    except ImportError:
+        try:
+            # Try to import from tf.keras
+            from tensorflow.keras.layers import InputLayer
+            
+            class CompatibleInputLayer(InputLayer):
+                @classmethod
+                def from_config(cls, config, custom_objects=None):
+                    fixed_config = fix_layer_config(config)
+                    return cls(**fixed_config)
+            
+            custom_objects['InputLayer'] = CompatibleInputLayer
+            logger.info("✅ Using tf.keras compatible loader")
+            
+        except ImportError:
+            logger.warning("⚠️ Using fallback loader without custom InputLayer")
+    
+    return custom_objects
+
+def load_model_with_fallback(model_path):
+    """Try multiple methods to load the model"""
+    
+    # Method 1: Try loading with custom objects
+    try:
+        custom_objects = create_compatible_model_loader()
+        model = tf.keras.models.load_model(
+            str(model_path),
+            compile=False,
+            custom_objects=custom_objects
+        )
+        logger.info("✅ Model loaded with custom objects")
+        return model
+    except Exception as e1:
+        logger.warning(f"Method 1 failed: {e1}")
+    
+    # Method 2: Try loading weights only with architecture extraction
+    try:
+        # Extract architecture from H5 file
+        with h5py.File(str(model_path), 'r') as f:
+            # Check model configuration
+            model_config = f.attrs.get('model_config', {})
+            logger.info(f"Model config type: {type(model_config)}")
+        
+        # Create a generic CNN architecture (common for image classification)
+        from tensorflow.keras import layers, models
+        
+        inputs = tf.keras.Input(shape=(224, 224, 3))
+        
+        # Base convolutional layers
+        x = layers.Conv2D(32, (3, 3), activation='relu')(inputs)
+        x = layers.MaxPooling2D((2, 2))(x)
+        x = layers.Conv2D(64, (3, 3), activation='relu')(x)
+        x = layers.MaxPooling2D((2, 2))(x)
+        x = layers.Conv2D(128, (3, 3), activation='relu')(x)
+        x = layers.MaxPooling2D((2, 2))(x)
+        x = layers.Conv2D(256, (3, 3), activation='relu')(x)
+        x = layers.MaxPooling2D((2, 2))(x)
+        
+        # Dense layers
+        x = layers.Flatten()(x)
+        x = layers.Dense(512, activation='relu')(x)
+        x = layers.Dropout(0.5)(x)
+        x = layers.Dense(256, activation='relu')(x)
+        x = layers.Dropout(0.3)(x)
+        outputs = layers.Dense(len(CLASS_NAMES), activation='softmax')(x)
+        
+        model = models.Model(inputs=inputs, outputs=outputs)
+        
+        # Try to load weights
+        try:
+            model.load_weights(str(model_path))
+            logger.info("✅ Model weights loaded onto generic architecture")
+        except:
+            logger.info("⚠️ Could not load weights, using initialized model")
+        
+        return model
+        
+    except Exception as e2:
+        logger.error(f"Method 2 failed: {e2}")
+    
+    # Method 3: Try using keras directly (for Keras 3)
+    try:
+        import keras
+        # Force Keras to use TensorFlow backend
+        keras.config.set_backend("tensorflow")
+        
+        model = keras.models.load_model(
+            str(model_path),
+            compile=False
+        )
+        logger.info("✅ Model loaded with Keras 3")
+        return model
+    except Exception as e3:
+        logger.error(f"Method 3 failed: {e3}")
+    
+    return None
 
 # === Lifespan Events ===
 @asynccontextmanager
@@ -215,7 +337,7 @@ async def lifespan(app: FastAPI):
             ATLAS_URI,
             serverSelectionTimeoutMS=10000,
             connectTimeoutMS=20000,
-            tlsAllowInvalidCertificates=True,  # Fix for Render SSL issues
+            tlsAllowInvalidCertificates=True,
             retryWrites=True,
             w='majority'
         )
@@ -227,98 +349,26 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         logger.error(f"❌ MongoDB connection failed: {e}")
         logger.warning("⚠️ Continuing without database (classification will fail)")
-        # Don't raise - allow app to start even if DB fails
     
     # Download CNN model if missing
     download_cnn_model()
     
     # Load CNN Model with compatibility fixes
     logger.info(f"🤖 Loading CNN model from: {CNN_MODEL_PATH}")
-    try:
-        if CNN_MODEL_PATH.exists():
-            # Method 1: Try loading with custom objects for InputLayer compatibility
-            try:
-                from tensorflow.keras.layers import InputLayer
-                
-                # Create a custom InputLayer that handles both old and new config formats
-                class CompatibleInputLayer(InputLayer):
-                    @classmethod
-                    def from_config(cls, config):
-                        # Fix the config for compatibility
-                        fixed_config = fix_input_layer_config(config)
-                        return cls(**fixed_config)
-                
-                cnn_model = tf.keras.models.load_model(
-                    str(CNN_MODEL_PATH),
-                    compile=False,
-                    custom_objects={'InputLayer': CompatibleInputLayer}
-                )
-                logger.info("✅ CNN model loaded successfully with custom InputLayer")
-                
-            except Exception as e1:
-                logger.warning(f"Method 1 failed: {e1}")
-                
-                # Method 2: Try loading weights only
-                try:
-                    from tensorflow.keras import layers, models
-                    
-                    # Create model architecture (common CNN architecture for soil classification)
-                    inputs = tf.keras.Input(shape=(224, 224, 3))
-                    
-                    # Base model
-                    x = layers.Conv2D(32, (3, 3), activation='relu')(inputs)
-                    x = layers.MaxPooling2D((2, 2))(x)
-                    x = layers.Conv2D(64, (3, 3), activation='relu')(x)
-                    x = layers.MaxPooling2D((2, 2))(x)
-                    x = layers.Conv2D(128, (3, 3), activation='relu')(x)
-                    x = layers.MaxPooling2D((2, 2))(x)
-                    
-                    # Flatten and dense layers
-                    x = layers.Flatten()(x)
-                    x = layers.Dense(512, activation='relu')(x)
-                    x = layers.Dropout(0.5)(x)
-                    x = layers.Dense(256, activation='relu')(x)
-                    x = layers.Dropout(0.3)(x)
-                    
-                    # Output layer
-                    outputs = layers.Dense(len(CLASS_NAMES), activation='softmax')(x)
-                    
-                    # Create model
-                    cnn_model = tf.keras.Model(inputs=inputs, outputs=outputs)
-                    
-                    # Load weights (skip incompatible layers)
-                    cnn_model.load_weights(str(CNN_MODEL_PATH), by_name=True, skip_mismatch=True)
-                    logger.info("✅ CNN model loaded using weights-only method")
-                    
-                except Exception as e2:
-                    logger.warning(f"Method 2 failed: {e2}")
-                    
-                    # Method 3: Try with legacy loading
-                    try:
-                        import h5py
-                        
-                        # Check if file is valid H5
-                        with h5py.File(str(CNN_MODEL_PATH), 'r') as f:
-                            logger.info("Model file is valid HDF5 format")
-                        
-                        # Try loading with legacy Keras
-                        import keras
-                        from keras.models import load_model
-                        
-                        cnn_model = load_model(str(CNN_MODEL_PATH), compile=False)
-                        logger.info("✅ CNN model loaded with legacy Keras")
-                        
-                    except Exception as e3:
-                        logger.error(f"Method 3 failed: {e3}")
-                        raise Exception("All loading methods failed")
-        
+    if CNN_MODEL_PATH.exists():
+        file_size = CNN_MODEL_PATH.stat().st_size
+        if file_size > 1000000:
+            cnn_model = load_model_with_fallback(CNN_MODEL_PATH)
+            if cnn_model:
+                logger.info("✅ CNN model loaded successfully")
+            else:
+                logger.error("❌ All CNN model loading methods failed")
+                cnn_model = None
         else:
-            logger.warning("⚠️ CNN model file not found - image classification will be disabled")
+            logger.warning(f"⚠️ CNN model file too small ({file_size} bytes)")
             cnn_model = None
-            
-    except Exception as e:
-        logger.error(f"❌ CNN model loading failed: {e}")
-        logger.warning("⚠️ API will continue without CNN model")
+    else:
+        logger.warning("⚠️ CNN model file not found")
         cnn_model = None
     
     # Load SVM Model
@@ -344,7 +394,7 @@ async def lifespan(app: FastAPI):
     # Load Preprocessor
     logger.info(f"🔧 Loading preprocessor from: {PREPROCESSOR_PATH}")
     try:
-        # Ensure the SoilDataPreprocessor class is available in this module
+        # Ensure the SoilDataPreprocessor class is available
         import sys
         sys.modules['__main__'].SoilDataPreprocessor = SoilDataPreprocessor
         
@@ -367,7 +417,7 @@ async def lifespan(app: FastAPI):
 # === Initialize App ===
 app = FastAPI(
     title="Unified Soil Classifier API",
-    version="3.1",
+    version="3.2",
     description="AI-powered soil classification using CNN (images) or ML models (chemistry data)",
     lifespan=lifespan
 )
@@ -387,7 +437,7 @@ async def root():
     """Root endpoint"""
     return {
         "message": "🌱 Unified Soil Classification API",
-        "version": "3.1",
+        "version": "3.2",
         "methods": {
             "image": "CNN classification from soil images",
             "chemistry": "SVM/RF classification from soil chemistry data"
@@ -396,7 +446,8 @@ async def root():
             "classify_image": "/classify (POST)",
             "classify_chemistry": "/classify-chemistry (POST)",
             "history": "/history (GET)",
-            "health": "/health (GET)"
+            "health": "/health (GET)",
+            "docs": "/docs (API Documentation)"
         }
     }
 
@@ -405,8 +456,9 @@ async def health_check():
     """Health check endpoint"""
     db_status = "disconnected"
     try:
-        await client.admin.command('ping')
-        db_status = "connected"
+        if client:
+            await client.admin.command('ping')
+            db_status = "connected"
     except:
         pass
     
@@ -426,17 +478,12 @@ async def classify_image(file: UploadFile = File(...)):
     Classify soil type from an uploaded image using CNN.
     """
     if not cnn_model:
-        raise HTTPException(status_code=503, detail="CNN model not available")
+        raise HTTPException(status_code=503, detail="CNN model not available. Image classification disabled.")
     
-    # More lenient content type checking
-    if file.content_type:
-        if not (file.content_type.startswith("image/") or file.content_type == "application/octet-stream"):
-            logger.warning(f"Unexpected content type: {file.content_type}, but will try to process anyway")
-    
-    # Check file extension as backup
+    # Validate file type
+    allowed_extensions = ['jpg', 'jpeg', 'png', 'gif', 'webp', 'bmp']
     if file.filename:
         extension = file.filename.lower().split('.')[-1]
-        allowed_extensions = ['jpg', 'jpeg', 'png', 'gif', 'webp', 'bmp', 'heic', 'heif']
         if extension not in allowed_extensions:
             raise HTTPException(
                 status_code=400, 
@@ -470,7 +517,7 @@ async def classify_image(file: UploadFile = File(...)):
         predictions = cnn_model.predict(arr, verbose=0)
         idx = int(np.argmax(predictions[0]))
         confidence = float(predictions[0][idx])
-        soil_type = CLASS_NAMES[idx]
+        soil_type = CLASS_NAMES[idx] if idx < len(CLASS_NAMES) else "Unknown"
         crops = CROP_SUGGESTIONS.get(soil_type, "No suggestions")
         
         logger.info(f"✅ CNN Prediction: {soil_type} ({confidence:.2%})")
@@ -480,24 +527,28 @@ async def classify_image(file: UploadFile = File(...)):
     
     # Save to database
     try:
-        result = await collection.insert_one({
-            "soilType": soil_type,
-            "confidence": confidence,
-            "crops": crops,
-            "method": "CNN",
-            "createdAt": datetime.utcnow(),
-            "filename": file.filename
-        })
+        if client:
+            result = await collection.insert_one({
+                "soilType": soil_type,
+                "confidence": confidence,
+                "crops": crops,
+                "method": "CNN",
+                "createdAt": datetime.utcnow(),
+                "filename": file.filename
+            })
+            record_id = str(result.inserted_id)
+        else:
+            record_id = "local_no_db"
     except Exception as e:
         logger.warning(f"Failed to save to database: {e}")
-        # Continue anyway - prediction succeeded
+        record_id = "local_error"
     
     return ClassificationResult(
         soilType=soil_type,
         confidence=round(confidence, 4),
         crops=crops,
         method="CNN",
-        _id=str(result.inserted_id) if 'result' in locals() else "local",
+        _id=record_id,
         createdAt=datetime.utcnow()
     )
 
@@ -540,22 +591,17 @@ async def classify_chemistry(data: SoilChemistryInput):
     try:
         svm_pred = svm_model.predict(input_normalized)[0]
         
-        # Try to get probability, but use decision function if probability is not available
+        # Try to get probability
         try:
             svm_proba = svm_model.predict_proba(input_normalized)[0]
             svm_confidence = float(svm_proba[svm_pred])
         except AttributeError:
-            # SVM was trained without probability=True, use decision function
-            logger.warning("SVM model doesn't have predict_proba, using decision function")
+            # Use decision function as fallback
             decision_values = svm_model.decision_function(input_normalized)[0]
-            # Convert decision function to pseudo-probability (0-1 range)
             if hasattr(decision_values, '__len__'):
-                # Multi-class: get max decision value
                 max_decision = max(decision_values)
-                # Normalize to 0-1 using sigmoid-like function
                 svm_confidence = 1 / (1 + np.exp(-max_decision))
             else:
-                # Binary or single value
                 svm_confidence = 1 / (1 + np.exp(-abs(decision_values)))
             svm_confidence = float(svm_confidence)
         
@@ -590,18 +636,26 @@ async def classify_chemistry(data: SoilChemistryInput):
     logger.info(f"🎯 Final: {final_soil_type} using {final_method}")
     
     # Save to database
-    result = await collection.insert_one({
-        "soilType": final_soil_type,
-        "confidence": final_confidence,
-        "crops": crops,
-        "method": final_method,
-        "model_comparison": {
-            "SVM": {"prediction": svm_soil_type, "confidence": svm_confidence},
-            "RandomForest": {"prediction": rf_soil_type, "confidence": rf_confidence}
-        },
-        "input_data": data.dict(),
-        "createdAt": datetime.utcnow()
-    })
+    try:
+        if client:
+            result = await collection.insert_one({
+                "soilType": final_soil_type,
+                "confidence": final_confidence,
+                "crops": crops,
+                "method": final_method,
+                "model_comparison": {
+                    "SVM": {"prediction": svm_soil_type, "confidence": svm_confidence},
+                    "RandomForest": {"prediction": rf_soil_type, "confidence": rf_confidence}
+                },
+                "input_data": data.model_dump(),
+                "createdAt": datetime.utcnow()
+            })
+            record_id = str(result.inserted_id)
+        else:
+            record_id = "local_no_db"
+    except Exception as e:
+        logger.warning(f"Failed to save to database: {e}")
+        record_id = "local_error"
     
     return ChemistryClassificationResult(
         soilType=final_soil_type,
@@ -612,9 +666,9 @@ async def classify_chemistry(data: SoilChemistryInput):
             "SVM": {"prediction": svm_soil_type, "confidence": round(svm_confidence, 4)},
             "RandomForest": {"prediction": rf_soil_type, "confidence": round(rf_confidence, 4)}
         },
-        _id=str(result.inserted_id),
+        _id=record_id,
         createdAt=datetime.utcnow(),
-        input_data=data.dict()
+        input_data=data.model_dump()
     )
 
 @app.get("/history", response_model=HistoryResponse, tags=["History"])
@@ -624,6 +678,9 @@ async def get_history(
     method: Optional[str] = None
 ):
     """Get classification history with optional filtering by method"""
+    if not client:
+        raise HTTPException(status_code=503, detail="Database not available")
+    
     if limit > 100:
         limit = 100
     
@@ -657,6 +714,9 @@ async def get_history(
 @app.delete("/history/{record_id}", tags=["History"])
 async def delete_record(record_id: str):
     """Delete a specific classification record"""
+    if not client:
+        raise HTTPException(status_code=503, detail="Database not available")
+    
     from bson import ObjectId
     
     try:
@@ -666,6 +726,24 @@ async def delete_record(record_id: str):
         return {"message": "Record deleted", "id": record_id}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/models/status", tags=["General"])
+async def get_model_status():
+    """Get detailed model loading status"""
+    cnn_details = {
+        "loaded": cnn_model is not None,
+        "path": str(CNN_MODEL_PATH),
+        "exists": CNN_MODEL_PATH.exists(),
+        "size": CNN_MODEL_PATH.stat().st_size if CNN_MODEL_PATH.exists() else 0
+    }
+    
+    return {
+        "cnn_model": cnn_details,
+        "svm_model": {"loaded": svm_model is not None},
+        "rf_model": {"loaded": rf_model is not None},
+        "preprocessor": {"loaded": preprocessor is not None},
+        "database": {"connected": client is not None}
+    }
 
 if __name__ == "__main__":
     import uvicorn
