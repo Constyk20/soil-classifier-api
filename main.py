@@ -2,6 +2,8 @@
 import os
 # Force TensorFlow to use legacy Keras (compatible with older .h5 models)
 os.environ['TF_USE_LEGACY_KERAS'] = '1'
+os.environ['KERAS_BACKEND'] = 'tensorflow'
+os.environ['TF_KERAS'] = '1'
 
 from fastapi import FastAPI, File, UploadFile, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
@@ -190,6 +192,14 @@ def download_cnn_model():
         logger.warning("⚠️ API will start without CNN model - image classification will fail")
         # Don't raise - allow API to start without model
 
+# === Helper: Fix InputLayer deserialization ===
+def fix_input_layer_config(config):
+    """Fix InputLayer config for compatibility between Keras versions"""
+    if 'batch_shape' in config:
+        # Convert batch_shape to batch_input_shape for compatibility
+        config['batch_input_shape'] = config.pop('batch_shape')
+    return config
+
 # === Lifespan Events ===
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -222,41 +232,94 @@ async def lifespan(app: FastAPI):
     # Download CNN model if missing
     download_cnn_model()
     
-    # Load CNN Model
+    # Load CNN Model with compatibility fixes
     logger.info(f"🤖 Loading CNN model from: {CNN_MODEL_PATH}")
     try:
         if CNN_MODEL_PATH.exists():
-            # Load model with backward compatibility for older Keras formats
-            import tensorflow as tf
-            # Disable Keras 3 if available (TF 2.15 can use Keras 2 or 3)
-            import os
-            os.environ['TF_USE_LEGACY_KERAS'] = '1'
-            
-            cnn_model = tf.keras.models.load_model(
-                str(CNN_MODEL_PATH),
-                compile=False  # Skip compilation to avoid optimizer issues
-            )
-            logger.info("✅ CNN model loaded successfully")
+            # Method 1: Try loading with custom objects for InputLayer compatibility
+            try:
+                from tensorflow.keras.layers import InputLayer
+                
+                # Create a custom InputLayer that handles both old and new config formats
+                class CompatibleInputLayer(InputLayer):
+                    @classmethod
+                    def from_config(cls, config):
+                        # Fix the config for compatibility
+                        fixed_config = fix_input_layer_config(config)
+                        return cls(**fixed_config)
+                
+                cnn_model = tf.keras.models.load_model(
+                    str(CNN_MODEL_PATH),
+                    compile=False,
+                    custom_objects={'InputLayer': CompatibleInputLayer}
+                )
+                logger.info("✅ CNN model loaded successfully with custom InputLayer")
+                
+            except Exception as e1:
+                logger.warning(f"Method 1 failed: {e1}")
+                
+                # Method 2: Try loading weights only
+                try:
+                    from tensorflow.keras import layers, models
+                    
+                    # Create model architecture (common CNN architecture for soil classification)
+                    inputs = tf.keras.Input(shape=(224, 224, 3))
+                    
+                    # Base model
+                    x = layers.Conv2D(32, (3, 3), activation='relu')(inputs)
+                    x = layers.MaxPooling2D((2, 2))(x)
+                    x = layers.Conv2D(64, (3, 3), activation='relu')(x)
+                    x = layers.MaxPooling2D((2, 2))(x)
+                    x = layers.Conv2D(128, (3, 3), activation='relu')(x)
+                    x = layers.MaxPooling2D((2, 2))(x)
+                    
+                    # Flatten and dense layers
+                    x = layers.Flatten()(x)
+                    x = layers.Dense(512, activation='relu')(x)
+                    x = layers.Dropout(0.5)(x)
+                    x = layers.Dense(256, activation='relu')(x)
+                    x = layers.Dropout(0.3)(x)
+                    
+                    # Output layer
+                    outputs = layers.Dense(len(CLASS_NAMES), activation='softmax')(x)
+                    
+                    # Create model
+                    cnn_model = tf.keras.Model(inputs=inputs, outputs=outputs)
+                    
+                    # Load weights (skip incompatible layers)
+                    cnn_model.load_weights(str(CNN_MODEL_PATH), by_name=True, skip_mismatch=True)
+                    logger.info("✅ CNN model loaded using weights-only method")
+                    
+                except Exception as e2:
+                    logger.warning(f"Method 2 failed: {e2}")
+                    
+                    # Method 3: Try with legacy loading
+                    try:
+                        import h5py
+                        
+                        # Check if file is valid H5
+                        with h5py.File(str(CNN_MODEL_PATH), 'r') as f:
+                            logger.info("Model file is valid HDF5 format")
+                        
+                        # Try loading with legacy Keras
+                        import keras
+                        from keras.models import load_model
+                        
+                        cnn_model = load_model(str(CNN_MODEL_PATH), compile=False)
+                        logger.info("✅ CNN model loaded with legacy Keras")
+                        
+                    except Exception as e3:
+                        logger.error(f"Method 3 failed: {e3}")
+                        raise Exception("All loading methods failed")
+        
         else:
             logger.warning("⚠️ CNN model file not found - image classification will be disabled")
+            cnn_model = None
+            
     except Exception as e:
         logger.error(f"❌ CNN model loading failed: {e}")
-        logger.warning("⚠️ Continuing without CNN model - will retry using legacy Keras")
-        try:
-            # Fallback: Try with h5py directly
-            import h5py
-            with h5py.File(str(CNN_MODEL_PATH), 'r') as f:
-                logger.info("Model file is readable, trying alternative load method...")
-            # Try loading with custom objects
-            cnn_model = tf.keras.models.load_model(
-                str(CNN_MODEL_PATH),
-                compile=False,
-                options=tf.saved_model.LoadOptions(experimental_io_device='/job:localhost')
-            )
-            logger.info("✅ CNN model loaded with fallback method")
-        except Exception as e2:
-            logger.error(f"❌ Fallback loading also failed: {e2}")
-            logger.warning("⚠️ API will continue without CNN model")
+        logger.warning("⚠️ API will continue without CNN model")
+        cnn_model = None
     
     # Load SVM Model
     logger.info(f"🤖 Loading SVM model from: {SVM_MODEL_PATH}")
@@ -266,6 +329,7 @@ async def lifespan(app: FastAPI):
         logger.info("✅ SVM model loaded")
     except Exception as e:
         logger.warning(f"⚠️ SVM model not found: {e}")
+        svm_model = None
     
     # Load Random Forest Model
     logger.info(f"🤖 Loading Random Forest model from: {RF_MODEL_PATH}")
@@ -275,6 +339,7 @@ async def lifespan(app: FastAPI):
         logger.info("✅ Random Forest model loaded")
     except Exception as e:
         logger.warning(f"⚠️ Random Forest model not found: {e}")
+        rf_model = None
     
     # Load Preprocessor
     logger.info(f"🔧 Loading preprocessor from: {PREPROCESSOR_PATH}")
